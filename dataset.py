@@ -67,45 +67,69 @@ class SongLanes:
         self.rng.shuffle(self.order)
         self.cursor = 0
         self.epoch = 0
-        self.lanes: list[tuple[int, int] | None] = [None] * batch
+        # Each lane keeps the assignment epoch of its current song. Different
+        # epochs can overlap while slower lanes finish longer songs.
+        self.lanes: list[tuple[int, int, int] | None] = [None] * batch
+        self.finished_per_epoch: dict[int, int] = {}
+        self.completed_epochs = 0
 
-    def _next_song(self) -> int:
+    def _next_song(self) -> tuple[int, int]:
         if self.cursor == len(self.order):
             self.epoch += 1
             self.rng.shuffle(self.order)
             self.cursor = 0
         song_index = self.order[self.cursor]
         self.cursor += 1
-        return song_index
+        return song_index, self.epoch
 
-    def next_batch(self, pad_id: int) -> tuple[Tensor, Tensor, Tensor, Tensor, list[bool]]:
+    def next_batch(
+        self, pad_id: int
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, list[bool], list[int], list[int]]:
         inputs = torch.full((self.batch, self.segment), pad_id, dtype=torch.long)
         labels = torch.full_like(inputs, -100)
         valid = torch.zeros((self.batch, self.segment), dtype=torch.bool)
         reset = [False] * self.batch
+        batch_epochs: list[int] = []
+        finished_epochs: list[int] = []
         for lane in range(self.batch):
             if self.lanes[lane] is None:
-                self.lanes[lane] = (self._next_song(), 0)
+                song_index, song_epoch = self._next_song()
+                self.lanes[lane] = (song_index, 0, song_epoch)
                 reset[lane] = True
-            song_index, offset = self.lanes[lane]
+            song_index, offset, song_epoch = self.lanes[lane]
+            batch_epochs.append(song_epoch)
             ids = self.songs[song_index][1]
             count = min(self.segment, len(ids) - 1 - offset)
             inputs[lane, :count] = torch.tensor(ids[offset : offset + count])
             labels[lane, :count] = torch.tensor(ids[offset + 1 : offset + count + 1])
             valid[lane, :count] = True
             offset += count
-            self.lanes[lane] = None if offset >= len(ids) - 1 else (song_index, offset)
-        return inputs, labels, valid, valid.sum(), reset
+            if offset >= len(ids) - 1:
+                self.lanes[lane] = None
+                finished = self.finished_per_epoch.get(song_epoch, 0) + 1
+                self.finished_per_epoch[song_epoch] = finished
+                if finished == len(self.songs):
+                    self.completed_epochs += 1
+                    finished_epochs.append(song_epoch)
+            else:
+                self.lanes[lane] = (song_index, offset, song_epoch)
+        return inputs, labels, valid, valid.sum(), reset, batch_epochs, finished_epochs
 
     def state_dict(self) -> dict:
         return {
             "order": self.order, "cursor": self.cursor, "epoch": self.epoch,
             "lanes": self.lanes, "rng_state": self.rng.getstate(),
+            "finished_per_epoch": self.finished_per_epoch,
+            "completed_epochs": self.completed_epochs,
         }
 
     def load_state_dict(self, state: dict) -> None:
+        if "finished_per_epoch" not in state:
+            raise ValueError("Checkpoint predates per-epoch history tracking")
         self.order = state["order"]
         self.cursor = state["cursor"]
         self.epoch = state["epoch"]
         self.lanes = state["lanes"]
+        self.finished_per_epoch = state["finished_per_epoch"]
+        self.completed_epochs = state["completed_epochs"]
         self.rng.setstate(state["rng_state"])

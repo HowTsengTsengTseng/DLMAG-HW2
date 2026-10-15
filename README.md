@@ -7,7 +7,8 @@ utilities. Training uses only the provided POP909 `training/` songs.
 ## Download Dataset
 Under the project root directory, run
 ```bash
-gdown "https://drive.google.com/file/d/1fw0qjeGzzmVkpz6aA8W3dEXygk9rX01t"
+gdown "https://drive.google.com/uc?id=1fw0qjeGzzmVkpz6aA8W3dEXygk9rX01t" --output POP909.zip
+unzip -t POP909.zip
 unzip POP909.zip
 ```
 ## Set up
@@ -58,6 +59,15 @@ embeddings, and detached segment memory. The default dimensions match the
 reference: 12 layers, 8 heads, width 512, inner width 2048, and 512-token
 segments and memory. The `train.py` model interface is unchanged. Checkpoints
 from the earlier model architecture cannot be resumed with this version.
+
+Training writes one JSON record per completed pass through all training songs
+to `<output-dir>/history.jsonl`. Each record includes the epoch number, start
+and completion steps, token-weighted training loss, processed tokens and
+segments, learning rate, and completion time. Because song lanes can have
+different lengths, an epoch is recorded only after every song assigned to it
+has finished. Checkpoints preserve unfinished epoch totals for exact resume;
+checkpoints created before this history format cannot resume with the current
+trainer. A fresh run requires a new output directory or `--resume`.
 
 ## Repair POP909 MIDI time signatures
 
