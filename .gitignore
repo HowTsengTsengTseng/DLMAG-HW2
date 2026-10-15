@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+checkpoints/
+data/
+POP909/
+third_party/
+tests/
+*.sf2

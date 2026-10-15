@@ -1,0 +1,24 @@
+[project]
+name = "dlmag-hw2"
+version = "0.1.0"
+description = "POP909 symbolic music generation for DLMAG Homework 2"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "gdown>=5.2",
+    "miditok>=3.1,<3.2",
+    "mido>=1.3.3",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "pretty-midi>=0.2.10",
+    "scipy>=1.11",
+    "torch>=2.4",
+    "tqdm>=4.66",
+]
+
+# The upstream MusDr repository has no package metadata. See README.md for
+# its source checkout and PYTHONPATH setup for eval_basic.py.
+[project.optional-dependencies]
+si = [
+    "librosa>=0.10",
+    "matplotlib>=3.8",
+]
