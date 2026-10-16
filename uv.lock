@@ -425,6 +425,7 @@ dependencies = [
     { name = "pretty-midi" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "symusic" },
     { name = "torch" },
     { name = "tqdm" },
 ]
@@ -447,6 +448,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.0" },
     { name = "pretty-midi", specifier = ">=0.2.10" },
     { name = "scipy", specifier = ">=1.11" },
+    { name = "symusic", specifier = ">=0.6,<1" },
     { name = "torch", specifier = ">=2.4" },
     { name = "tqdm", specifier = ">=4.66" },
 ]

@@ -134,7 +134,7 @@ def main() -> None:
     history_path = args.output_dir / "history.jsonl"
     if args.resume:
         # Restore the history to the selected checkpoint, including when the
-        previous process wrote later epochs before it stopped.
+        # previous process wrote later epochs before it stopped.
         checkpoint_history = "".join(json.dumps(row) + "\n" for row in history_records)
         if history_path.exists() and history_path.read_text(encoding="utf-8") != checkpoint_history:
             backup = args.output_dir / f"history.before_resume_{uuid4().hex[:8]}.jsonl"

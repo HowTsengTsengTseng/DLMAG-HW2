@@ -20,6 +20,9 @@ not already available, then run:
 uv sync
 ```
 
+On a machine without `uv`, install the direct Python dependencies with
+`python -m pip install -r requirements.txt`. Use Python 3.11–3.13.
+
 `pyproject.toml` includes `gdown`, PyTorch, MidiTok, MIDI processing, and the
 NumPy/pandas/SciPy/tqdm packages imported by the TA's scripts in
 `../hw2_sample/HW2_scripts/`.
@@ -48,6 +51,115 @@ is required by current FluidSynth versions.
 The training script expects tokenized sequences, a token-to-ID vocabulary, and
 the exact tokenizer configuration JSON. The steps below produce those
 preprocessing artifacts; choose a training step budget before running `train.py`.
+
+## Basic A: unconditional 32-bar generation
+
+Use the same checkpoint and tokenizer for both tasks. Generate one file to
+check the workstation setup first:
+
+```bash
+uv run python infer_a.py \
+  --checkpoint checkpoints/pop909_remi/step_00030000.pt \
+  --output results/basic_a/K10/1000.mid \
+  --top-k 50 --temperature 1.0 --seed 1000
+```
+
+The script starts with `Bar_None`, 4/4, and the tempo token nearest 120 BPM
+(currently 121.29 BPM), without a music or chord prompt. It stops at the start
+of bar 33 and saves MIDI, metadata JSON, and a token JSON for the TA evaluator.
+Generated time-signature tokens are masked for all configurations. This fixed
+meter policy also applies to Task B.
+
+Run all six sampling configurations (top-k 50 or top-p 0.9, each with
+temperature 0.8, 1.0, and 1.2):
+
+```bash
+uv run python run_experiments.py \
+  --checkpoint checkpoints/pop909_remi/step_00030000.pt \
+  --task all --output-root results
+```
+
+This makes 20 Task A MIDI files per configuration (seeds 1000–1019) and three
+Task B MIDI files per configuration (prompt seeds 2000–2002). It records failed
+jobs in `results/generation_manifest.jsonl` and exits with an error if any
+failed. Pass `--resume` to keep completed files and rerun incomplete jobs.
+The fixed retry policy is two replacement attempts, using seeds
+`original+10000` and `original+20000`; every attempt and its reason is logged.
+Use `--retries 0` to disable replacements. Report replacement counts alongside
+the results.
+For a small check, use `--configs K10 --a-count 1`; use a separate output root
+for such a check so it cannot be confused with the formal experiment.
+
+To calculate H4 and GS with the TA's evaluator, clone MusDr as described above,
+then run:
+
+```bash
+uv run python evaluate_task_a.py \
+  --results-root results \
+  --output-dir metrics/basic_a
+```
+
+`prepare_eval_basic.py` maps `Bar_None` to `Bar` and `Position_*` to `Pos_*`,
+retains pitch events, and clips to 32 bars. It applies the same conversion to
+the generated token sequences and the first 32 bars of each eligible 4/4
+training song. Training songs with fewer than 32 bars or a different meter are
+listed in `metrics/basic_a/reference/manifest.json`; the reference is training
+data, not a held-out test set. `evaluate_task_a.py` writes per-piece scores to
+each configuration's `scores.csv`, and means plus sample standard deviations
+to `metrics/basic_a/summary.csv`. Each formal configuration must contain all
+20 pieces; missing files and NaN scores cause an error.
+
+## Task B: continue an eight-bar prompt
+
+Use the checkpoint and tokenizer from the same training run. Each Basic B prompt
+folder contains its MIDI, beat annotations, and chord annotations. For example:
+
+```bash
+uv run python infer.py \
+  --checkpoint checkpoints/pop909_remi/step_00030000.pt \
+  --prompt-midi POP909/prompts/basic-b/001/001.mid \
+  --output results/basic_b/K10/001.mid \
+  --top-k 50 --temperature 1.0 --seed 2000
+```
+
+The output contains the original eight-bar prompt plus 24 generated bars.
+`infer.py` uses `beat_midi.txt` to establish the exact prompt boundary,
+feeds all prompt tokens through Transformer-XL memory, and ends at bar 33.
+The continuation keeps the prompt's 4/4 meter by masking further
+`TimeSig_*` tokens during sampling; use this same rule for every sampling
+setting.
+It keeps the prompt notes on the annotated beat grid in the output rather than
+replacing them with the coarser tokens used for model context. A matching JSON
+metadata file is written beside the MIDI. Use `--top-p 0.9` instead of
+`--top-k 50` for nucleus sampling.
+Repeat for prompt IDs `002` and `003`, using seeds `2001` and `2002`.
+If the checkpoint was trained with chord tokens, the prompt's
+`chord_midi.txt` is used for context; chord labels are not exported as MIDI
+annotations.
+
+After comparing results and listening, select one Basic A configuration and
+three Basic B configurations. Render the required 20 + 9 MIDI/WAV pairs with
+one SoundFont and sample rate:
+
+```bash
+uv run python render_submission.py \
+  --results-root results --output-dir submission \
+  --soundfont GeneralUser-GS.sf2 \
+  --a-config K10 --b-configs K08 K10 P10 \
+  --best K10 P10 K08
+```
+
+`--best` lists the preferred Basic B version for prompts 001, 002, and 003.
+Replace the configuration choices after evaluating the actual generated music.
+The renderer requires the `fluidsynth` executable on `PATH`. The output path
+for every standalone inference MIDI can also be set directly with `--output`.
+
+The current preprocessed tokenizer includes POP909 chord annotation tokens.
+This differs from the earlier local experiment plan's no-chord default, but
+does not create an additional inference condition. Keep the same tokenizer and
+checkpoint for every configuration and state the use of chord tokens in the
+report. Task A receives no ground-truth chord sequence; Task B uses the
+provided prompt chord file only as context for the eight prompt bars.
 
 ## Model
 
@@ -127,6 +239,24 @@ The output directory contains `train_sequences.json`, `tok2idx.json`, and
 loading the same MidiTok tokenizer when decoding generated music. For example,
 pass the first three files to `train.py` with its `--sequences`, `--vocab`, and
 `--tokenizer-config` options. The training script is not run by preprocessing.
+
+Example formal training command after benchmarking (replace the step budget
+and batch settings with the values actually chosen for the run):
+
+```bash
+uv run python train.py \
+  --sequences data/miditok_remi_chords/train_sequences.json \
+  --vocab data/miditok_remi_chords/tok2idx.json \
+  --tokenizer-config data/miditok_remi_chords/tokenizer_config.json \
+  --training-dir POP909/training --expected-songs 896 \
+  --output-dir checkpoints/pop909_remi --steps 30000 \
+  --batch-size 4 --grad-accum 4
+```
+
+The script's default `--steps 2` is a smoke-run default, not the formal
+training budget. Inspect the selected checkpoint's `run_config` before
+reporting the actual run settings. See `EXPERIMENT_AUDIT.md` for the course
+requirement checklist and the remaining workstation checks.
 
 POP909's three tracks are all MIDI program 0. To keep their roles distinct in
 one REMI sequence, `tokenize_miditok.py` temporarily assigns program 0 to
