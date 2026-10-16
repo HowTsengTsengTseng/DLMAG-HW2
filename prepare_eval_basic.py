@@ -13,7 +13,7 @@ def arguments() -> argparse.Namespace:
                         help="Task A configuration directory, or train_sequences.json")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--vocab", type=Path, default=Path(
-        "data/miditok_remi_chords/tok2idx.json"),
+        "data/miditok_remi_no_chords/tok2idx.json"),
                         help="Shared training vocabulary for identical metric bins")
     parser.add_argument("--songs", type=int, default=20,
                         help="Expected generated song count; ignored for training reference")
@@ -33,18 +33,32 @@ def meter_is_4_4(tokens: list[str]) -> bool:
     return bool(signatures) and set(signatures) == {"TimeSig_4/4"}
 
 
-def convert(tokens: list[str]) -> list[str]:
+def convert(tokens: list[str]) -> tuple[list[str], int]:
     result = []
+    current_position: str | None = None
+    position_emitted = False
+    orphan_pitches = 0
     for token in tokens:
         if token.startswith("Bar_"):
             result.append("Bar")
+            current_position = None
+            position_emitted = False
         elif token.startswith("Position_"):
-            result.append("Pos_" + token.split("_", 1)[1])
+            current_position = "Pos_" + token.split("_", 1)[1]
+            position_emitted = False
         elif token.startswith("Pitch_"):
+            if current_position is None:
+                # A sampled token stream can violate REMI event order. Do not
+                # invent an onset for a pitch that the MIDI decoder cannot place.
+                orphan_pitches += 1
+                continue
+            if not position_emitted:
+                result.append(current_position)
+                position_emitted = True
             result.append(token)
     if result.count("Bar") != 32:
         raise ValueError("Converted sequence is not 32 bars")
-    return result
+    return result, orphan_pitches
 
 
 def main() -> None:
@@ -63,8 +77,10 @@ def main() -> None:
                 raise FileNotFoundError(f"Corresponding MIDI is missing: {midi}")
     output = []
     skipped = []
+    malformed = []
     for item in data:
-        clipped = first_32_bars(item["tokens"])
+        raw_tokens = item["tokens"]
+        clipped = first_32_bars(raw_tokens)
         if clipped is None:
             if not reference:
                 raise ValueError(f"Generated piece lacks 32 bars: {item['song_name']}")
@@ -75,7 +91,18 @@ def main() -> None:
                 raise ValueError(f"Generated piece changes meter: {item['song_name']}")
             skipped.append({"song_name": item["song_name"], "reason": "not fixed 4/4"})
             continue
-        output.append({"song_name": item["song_name"], "tokens": convert(clipped)})
+        converted, orphan_pitches = convert(clipped)
+        output.append({"song_name": item["song_name"], "tokens": converted})
+        first_bar = next(i for i, token in enumerate(raw_tokens)
+                         if token.startswith("Bar_"))
+        leading_events = [token for token in raw_tokens[:first_bar]
+                          if token not in {"<BOS>", "<PAD>"}]
+        if orphan_pitches or leading_events:
+            malformed.append({
+                "song_name": item["song_name"],
+                "orphan_pitches_ignored": orphan_pitches,
+                "events_before_first_bar_ignored": len(leading_events),
+            })
     if not output:
         raise ValueError("No eligible 32-bar pieces")
     training_vocab = json.loads(args.vocab.read_text(encoding="utf-8"))
@@ -95,9 +122,11 @@ def main() -> None:
     (args.output_dir / "manifest.json").write_text(json.dumps({
         "source": str(args.input), "reference": reference,
         "included": [item["song_name"] for item in output], "skipped": skipped,
-        "rule": "first 32 complete 4/4 bars; Bar/Position/Pitch events only",
+        "malformed_events": malformed,
+        "rule": "first 32 complete 4/4 bars; Bar and Pitch plus positions containing notes",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Prepared {len(output)} pieces; skipped {len(skipped)} -> {args.output_dir}")
+    print(f"Prepared {len(output)} pieces; skipped {len(skipped)}; "
+          f"malformed event sequences {len(malformed)} -> {args.output_dir}")
 
 
 if __name__ == "__main__":

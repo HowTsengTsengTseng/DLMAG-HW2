@@ -21,7 +21,9 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-root", type=Path, default=Path("results"))
     parser.add_argument("--training-sequences", type=Path, default=Path(
-        "data/miditok_remi_chords/train_sequences.json"))
+        "data/miditok_remi_no_chords/train_sequences.json"))
+    parser.add_argument("--vocab", type=Path, default=Path(
+        "data/miditok_remi_no_chords/tok2idx.json"))
     parser.add_argument("--ta-script", type=Path, default=Path(
         "../hw2_sample/HW2_scripts/eval_basic.py"))
     parser.add_argument("--musdr-parent", type=Path, default=Path("third_party"))
@@ -65,10 +67,12 @@ def main() -> None:
         (name, args.results_root / "basic_a" / name, args.songs) for name in args.configs
     ]
     summaries = []
+    reference_summary = None
     for name, source, count in sources:
         prepared = args.output_dir / name
         command = [sys.executable, str(HERE / "prepare_eval_basic.py"),
-                   "--input", str(source), "--output-dir", str(prepared)]
+                   "--input", str(source), "--output-dir", str(prepared),
+                   "--vocab", str(args.vocab)]
         if count is not None:
             command += ["--songs", str(count)]
         run(command)
@@ -77,7 +81,19 @@ def main() -> None:
              "--tok2idx_path", str(prepared / "tok2idx.json"),
              "--sequences_path", str(prepared / "sequences.json"),
              "--output_csv", str(output_csv)], env=env)
-        summaries.append(summarize(output_csv, name))
+        row = summarize(output_csv, name)
+        if name == "reference":
+            reference_summary = row
+        else:
+            summaries.append(row)
+    if reference_summary is None:
+        raise RuntimeError("Reference evaluation was not produced")
+    with (args.output_dir / "reference_summary.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(reference_summary))
+        writer.writeheader()
+        writer.writerow(reference_summary)
     with (args.output_dir / "summary.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(summaries[0]))
         writer.writeheader()
@@ -86,9 +102,11 @@ def main() -> None:
         "ta_script": str(args.ta_script.resolve()),
         "musdr_source": str((args.musdr_parent / "MusDr").resolve()),
         "reference_rule": "first 32 bars of fixed-4/4 training songs, no held-out claim",
+        "reference_sequences": str(args.training_sequences.resolve()),
+        "shared_vocabulary": str(args.vocab.resolve()),
         "configs": args.configs, "songs_per_config": args.songs,
     }, indent=2), encoding="utf-8")
-    print(f"Summary: {args.output_dir / 'summary.csv'}")
+    print(f"{len(summaries)} Task A experiment rows: {args.output_dir / 'summary.csv'}")
 
 
 if __name__ == "__main__":
