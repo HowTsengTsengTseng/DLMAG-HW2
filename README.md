@@ -162,7 +162,9 @@ specify all three paths for the no-chord run. `--training-dir` defaults to
 `POP909/training`, `--expected-songs` to `896`, and `--output-dir` to
 `checkpoints/pop909_remi`. The script checks that the tokenized songs match this
 training split, then writes `run_config.json`, `history.jsonl`, and step
-checkpoints such as `step_00010000.pt` under `--output-dir`.
+checkpoints such as `step_00010000.pt` under `--output-dir`. At startup it prints
+the input paths, hashes, vocabulary size, and `chord_source`; it rejects a
+mix of chord and no-chord sequences, vocabulary, and tokenizer metadata.
 
 | Option | Meaning | Default |
 | --- | --- | ---: |
@@ -219,6 +221,23 @@ uv run python train.py \
 
 Changing `--steps`, batch size, model dimensions, or input files while
 resuming is rejected; a longer training budget needs a new run plan.
+
+If chord and no-chord `history.jsonl` files appear identical, audit the actual
+inputs recorded by each run before interpreting the experiment:
+
+```bash
+uv run python audit_chord_runs.py \
+  --no-chord-run checkpoints/no_chords \
+  --chord-run checkpoints/chords \
+  --no-chord-checkpoint checkpoints/no_chords/step_00030000.pt \
+  --chord-checkpoint checkpoints/chords/step_00030000.pt
+```
+
+The checkpoint options are optional when only `run_config.json` and
+`history.jsonl` are available. With the current 896-song preprocessing and
+512-token segments, a complete no-chord epoch has 6,930,788 tokens and 13,985
+segments; a chord epoch has 7,047,239 tokens and 14,216 segments. Identical
+epoch counts mean the two runs did not use these different token sequences.
 
 ### Model and checkpoint details
 
@@ -370,3 +389,73 @@ uv run python render_submission.py \
 Replace the configuration choices after evaluating the actual generated music.
 The renderer requires the `fluidsynth` executable on `PATH`. The output path
 for every standalone inference MIDI can also be set directly with `--output`.
+
+## Bonus task: bar-interleaved accompaniment
+
+The bonus model uses a separate representation and checkpoint. Each training
+song becomes one autoregressive sequence:
+
+```text
+<BOS> <BAR> <MELODY> melody note events <PIANO> piano note events
+      <BAR> <MELODY> melody note events <PIANO> piano note events ... <EOS>
+```
+
+A note event is `Pos_i Pitch_p Vel_v Dur_d`. Positions and durations use 64
+units per bar, so 4-beat, 6-beat, and irregular prompt bars share one vocabulary.
+Velocity uses 32 bins; durations longer than four bars are clipped. The model
+receives both tracks during training and uses next-token loss on **all** tokens.
+During inference, `infer_bonus.py` inserts the given melody for each bar and
+samples only the piano section. It constrains the note-token grammar and forces
+a bar boundary after at most 96 generated notes per bar. Future melody bars are
+not visible until they are inserted.
+
+Preparation reads only the 896 time-signature-corrected training MIDI files.
+It selects their named `MELODY` and `PIANO` tracks and discards `BRIDGE`.
+The bonus prompts' `piano.mid` files are used only for evaluation, never for
+training or generation.
+
+### Prepare and train the bonus model
+
+First create `POP909/training_timesig_fixed_col3/` and its manifest with the
+time-signature repair workflow above. Then run:
+
+```bash
+uv run python prepare_bonus.py
+uv run python train_bonus.py --steps 30000 --batch-size 4 --grad-accum 4 \
+  --output-dir checkpoints/bonus_interleaved
+```
+
+Choose the step budget and batch size for the available hardware. The inherited
+default of two optimizer steps is only a smoke run. Use `--precision fp32` on a
+machine without CUDA BF16. `train_bonus.py` accepts the `train.py` options,
+including `--resume`. A Basic A/B checkpoint cannot be used for bonus inference
+because its vocabulary and training sequence differ.
+
+### Generate and evaluate bonus prompts
+
+Generate one of the ten prompts with:
+
+```bash
+uv run python infer_bonus.py \
+  --checkpoint checkpoints/bonus_interleaved/step_00030000.pt \
+  --prompt-midi POP909/prompts/bonus/001/melody.mid \
+  --output results/bonus/001.mid --top-k 50 --temperature 1.0 --seed 2001
+```
+
+The script reads `beat_midi.txt` beside `melody.mid` by default, writes the
+original MELODY and generated PIANO tracks, and saves sampling metadata in
+`001.json`. It does not read the prompt's ground-truth `piano.mid`. Repeat with
+prompt and output IDs `001` through `010` using a fixed seed policy. Set each
+output file path with `--output`.
+
+Render a WAV and evaluate the complete ten-file set with:
+
+```bash
+uv run python midi2wav.py results/bonus/001.mid results/bonus/001.wav
+uv run python ../hw2_sample/HW2_scripts/eval_bonus.py \
+  --prompt_dir POP909/prompts/bonus --gen_midi_dir results/bonus \
+  --output_csv results/bonus_metrics.csv
+```
+
+The TA evaluator expects generated files named `001.mid` through `010.mid`.
+Run it after generating all ten files for the formal comparison.
