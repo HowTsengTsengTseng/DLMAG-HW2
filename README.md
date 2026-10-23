@@ -1,5 +1,71 @@
 # DLMAG Homework 2: Symbolic Music Generation
 
+## Grader TL;DR: inference and listening samples
+Run this to download trained checkpoints and listening samples:
+```bash
+gdown "https://drive.google.com/uc?id=1_qqursH0RnIWee0JSlEInLeT9zAQb7T9"
+unzip dlmag_hw2.zip
+```
+
+Run these commands from the repository root with Python 3.11–3.13. The supplied
+checkpoints are trained from scratch on the 896 POP909 training songs; inference
+does **not** require rerunning preprocessing or training. Install dependencies
+with `uv sync` (or `python -m pip install -r requirements.txt`). The three tasks
+use different input prompts and output lengths:
+
+| Task | Input | Output | Inference script |
+| --- | --- | --- | --- |
+| Basic A | No music prompt | 20 selected 32-bar MIDIs | `run_experiments.py` (calls `infer_a.py`) |
+| Basic B | One provided 8-bar Basic B MIDI prompt | Original 8 bars + 24 generated bars | `infer.py` |
+| Bonus | One provided 16-bar MELODY prompt | MELODY + generated PIANO, 16 bars | `infer_bonus.py` |
+
+To generate the submitted Basic A setting (`C20T10`), all nine Basic B files,
+and all ten Bonus files, run these commands from the repository root:
+
+```bash
+uv run python run_experiments.py \
+  --config C20T10 \
+  --chord-checkpoint checkpoints/chords/step_00030000.pt \
+  --output-root results
+
+uv run python infer.py \
+  --all-configs --prompt-root POP909/prompts/basic-b \
+  --output-dir results/basic_b
+
+uv run python infer_bonus.py \
+  --checkpoint checkpoints/bonus_interleaved/step_00030000.pt \
+  --prompt-root POP909/prompts/bonus --output-dir results/bonus \
+  --top-k 50 --temperature 1.0 --seed 2001
+```
+
+Basic A writes 20 files under `results/basic_a/C20T10/`; Task B writes three
+files per configuration under `results/basic_b/`; Bonus writes ten files under
+`results/bonus/`. Each MIDI has matching metadata JSON. Basic A also writes
+token JSON. The Basic B command uses the default chord and no-chord checkpoints
+and their matching tokenizers; override their paths with
+`--chord-checkpoint`, `--no-chord-checkpoint`, `--tokenizer`, and
+`--no-chord-tokenizer` if needed. The Bonus model has its own checkpoint and
+representation.
+
+To render **all generated MIDI files** from the three tasks into WAVs, run:
+
+```bash
+uv run python render_submission.py \
+  --basic-a-dir results/basic_a \
+  --basic-b-dir results/basic_b \
+  --bonus-dir results/bonus \
+  --output-dir rendered_all \
+  --soundfont GeneralUser-GS.sf2
+```
+
+This recursively copies the MIDI and JSON files and writes a WAV beside each
+MIDI under `rendered_all/`. FluidSynth must be installed on `PATH`, and
+`GeneralUser-GS.sf2` must point to a SoundFont file.
+
+See the sections below for the full 20-piece Basic A matrix, all three Basic B
+prompts, ten Bonus prompts, evaluation, and batch rendering. The model and
+tokenizer paths in each command must be kept as a matching pair.
+
 This is a flat `uv` project. The current training entry point is `train.py`;
 `model.py`, `dataset.py`, and `utils.py` provide its model, data, and shared
 utilities. Training uses only the provided POP909 `training/` songs.
@@ -117,17 +183,6 @@ collapsed into one change token. MidiTok's note-based chord detector is
 disabled for encoding, so its inferred chords do not conflict with POP909's
 annotations. Keep the two output directories separate.
 
-<!-- To compare annotated chords with MidiTok's automatic note-based chord detection
-on the same corrected MIDI files, run:
-
-```bash
-uv run python tests/compare_chord_tokenization.py --song-ids 001 170
-``` -->
-
-The comparison reports event counts, matching labels at the same tick and
-within a configurable number of quarter-note beats, plus examples of timing
-or label differences. Use `--all --show 0` for a summary of all 896 songs.
-
 The output directory contains `train_sequences.json`, `tok2idx.json`, and
 `tokenizer_config.json` for `train.py`, plus `miditok_tokenizer.json` for
 loading the same MidiTok tokenizer when decoding generated music. For example,
@@ -198,11 +253,6 @@ uv run python train.py \
   --batch-size 4 --grad-accum 4
 ```
 
-The script's default `--steps 2` is a smoke-run default, not the formal
-training budget. Inspect the selected checkpoint's `run_config` before
-reporting the actual run settings. See `EXPERIMENT_AUDIT.md` for the course
-requirement checklist and the remaining workstation checks.
-
 To resume an interrupted run, repeat the **same training arguments and total
 step budget** and add `--resume` pointing to a checkpoint in that output
 directory. For example, if the no-chord 30,000-step run stopped after step
@@ -221,23 +271,6 @@ uv run python train.py \
 
 Changing `--steps`, batch size, model dimensions, or input files while
 resuming is rejected; a longer training budget needs a new run plan.
-
-If chord and no-chord `history.jsonl` files appear identical, audit the actual
-inputs recorded by each run before interpreting the experiment:
-
-```bash
-uv run python audit_chord_runs.py \
-  --no-chord-run checkpoints/no_chords \
-  --chord-run checkpoints/chords \
-  --no-chord-checkpoint checkpoints/no_chords/step_00030000.pt \
-  --chord-checkpoint checkpoints/chords/step_00030000.pt
-```
-
-The checkpoint options are optional when only `run_config.json` and
-`history.jsonl` are available. With the current 896-song preprocessing and
-512-token segments, a complete no-chord epoch has 6,930,788 tokens and 13,985
-segments; a chord epoch has 7,047,239 tokens and 14,216 segments. Identical
-epoch counts mean the two runs did not use these different token sequences.
 
 ### Model and checkpoint details
 
@@ -298,7 +331,7 @@ of bar 33 and saves MIDI, metadata JSON, and a token JSON for the TA evaluator.
 Generated time-signature tokens are masked for all configurations. This fixed
 meter policy also applies to Task B.
 
-Run the full seven-group matrix for Task A only:
+Run the full seven-group matrix for Task A:
 
 ```bash
 uv run python run_experiments.py \
@@ -308,9 +341,21 @@ uv run python run_experiments.py \
 ```
 
 This makes 20 Task A MIDI files per configuration (seeds 1000–1019), for 140
-generated pieces and seven experiment rows. Task B is run separately. The
-script records failed jobs in `results/generation_manifest.jsonl` and exits with an error if any
-failed. Pass `--resume` to keep completed files and rerun incomplete jobs.
+generated pieces and seven experiment rows. Task B is run separately. To
+reproduce only the submitted `C20T10` Basic A set, run:
+
+```bash
+uv run python run_experiments.py \
+  --config C20T10 \
+  --chord-checkpoint checkpoints/chords/step_00030000.pt \
+  --output-root reproduced
+```
+
+This writes `reproduced/basic_a/C20T10/1000.mid` through `1019.mid` and their
+JSON files. `--configs C20T10` remains available for existing commands.
+The script records attempts in `<output-root>/generation_manifest.jsonl` and
+exits with an error if any failed. Pass `--resume` to keep completed files and
+rerun incomplete jobs.
 The fixed retry policy is two replacement attempts, using seeds
 `original+10000` and `original+20000`; every attempt and its reason is logged.
 Use `--retries 0` to disable replacements. Report replacement counts alongside
@@ -353,7 +398,7 @@ uv run python infer.py \
   --tokenizer data/miditok_remi_no_chords/miditok_tokenizer.json \
   --prompt-midi POP909/prompts/basic-b/001/001.mid \
   --output results/basic_b/N20T10/001.mid \
-  --top-k 20 --temperature 1.0 --seed 2000
+  --top-k 20 --temperature 1.0 --seed 42
 ```
 
 The output contains the original eight-bar prompt plus 24 generated bars.
@@ -365,30 +410,69 @@ setting.
 It keeps the prompt notes on the annotated beat grid in the output rather than
 replacing them with the coarser tokens used for model context. A matching JSON
 metadata file is written beside the MIDI.
-Repeat for prompt IDs `002` and `003`, using seeds `2001` and `2002`.
+Repeat for prompt IDs `002` and `003`, choosing an output path and seed for
+each run.
+
+To generate all three Basic B prompts with the submitted `C20T10` setting in
+one command (seed 42 is reset for each prompt), run:
+
+```bash
+uv run python infer.py --checkpoint checkpoints/chords/step_00030000.pt --prompt-root POP909/prompts/basic-b --output-dir results/basic_b/C20T10 --experiment-id C20T10 --top-k 20 --temperature 1.0 --seed 42
+```
+
+This writes `001.mid` through `003.mid` with matching JSON files. For a
+no-chord checkpoint, also pass its matching `--tokenizer`. Batch mode refuses
+existing output files; use a new output directory for another run.
+
+To generate the complete nine-file Task B submission (three settings across
+all three prompts) in one command, run:
+
+```bash
+uv run python infer.py --all-configs --prompt-root POP909/prompts/basic-b --output-dir results/basic_b
+```
+
+This uses the default no-chord and chord checkpoints and their matching
+tokenizers, with top-k 20, 50, and 20 respectively, temperature 1.0, and seed
+42 reset for every file. Outputs go to `results/basic_b/<config>/001.mid`
+through `003.mid`, each with matching metadata. Override checkpoint paths with
+`--no-chord-checkpoint` and `--chord-checkpoint` if needed.
+
 If the checkpoint was trained with chord tokens, the prompt's
 `chord_midi.txt` is used for context; chord labels are not exported as MIDI
 annotations.
 
-## Render WAVs and select submission files
+## Render MIDI/WAV submission files
 
-After comparing results and listening, select one Task A configuration and
-prepare three Task B configurations independently with `infer.py` for all three
-prompts. Render the required 20 + 9 MIDI/WAV pairs with
-one SoundFont and sample rate:
+`render_submission.py` searches each input directory recursively, copies every MIDI and
+its matching JSON, and renders a WAV beside the copied MIDI. For example,
+`results/basic_b/C20T10/001.mid` becomes
+`rendered_all/basic_b/C20T10/001.wav`. The default sample rate is 44,100 Hz;
+add `--sample-rate` to change it. Use a new output directory if you run the
+renderer again, because it refuses to overwrite existing files.
+
+Collect the chosen Basic A, Basic B, and Bonus outputs into three input
+directories. Each MIDI must have a matching metadata JSON with the same stem
+(`1000.mid` with `1000.json`, for example). Additional JSON files such as
+`1000.tokens.json` are copied too. The script renders **every** MIDI found in
+each directory, including nested subdirectories, and preserves those relative
+paths in `submission/basic_a/`, `submission/basic_b/`, and `submission/bonus/`.
+It does not select configurations or preferred Basic B files; organize those
+choices in the input directories before rendering.
 
 ```bash
 uv run python render_submission.py \
-  --results-root results --output-dir submission \
-  --soundfont GeneralUser-GS.sf2 \
-  --a-config N20T10 --b-configs N20T10 N50T10 C20T10 \
-  --best N20T10 C20T10 N50T10
+  --basic-a-dir results/selected_basic_a \
+  --basic-b-dir results/selected_basic_b \
+  --bonus-dir results/bonus \
+  --output-dir submission \
+  --soundfont GeneralUser-GS.sf2
 ```
 
-`--best` lists the preferred Basic B version for prompts 001, 002, and 003.
-Replace the configuration choices after evaluating the actual generated music.
-The renderer requires the `fluidsynth` executable on `PATH`. The output path
-for every standalone inference MIDI can also be set directly with `--output`.
+The renderer copies their MIDI/JSON
+files and writes one WAV beside each MIDI using the same SoundFont and sample
+rate (default 44,100 Hz). It refuses missing metadata or existing output files.
+FluidSynth must be on `PATH`. Individual inference scripts also accept an
+explicit `--output` path.
 
 ## Bonus task: bar-interleaved accompaniment
 
@@ -425,12 +509,6 @@ uv run python train_bonus.py --steps 30000 --batch-size 4 --grad-accum 4 \
   --output-dir checkpoints/bonus_interleaved
 ```
 
-Choose the step budget and batch size for the available hardware. The inherited
-default of two optimizer steps is only a smoke run. Use `--precision fp32` on a
-machine without CUDA BF16. `train_bonus.py` accepts the `train.py` options,
-including `--resume`. A Basic A/B checkpoint cannot be used for bonus inference
-because its vocabulary and training sequence differ.
-
 ### Generate and evaluate bonus prompts
 
 Generate one of the ten prompts with:
@@ -444,9 +522,16 @@ uv run python infer_bonus.py \
 
 The script reads `beat_midi.txt` beside `melody.mid` by default, writes the
 original MELODY and generated PIANO tracks, and saves sampling metadata in
-`001.json`. It does not read the prompt's ground-truth `piano.mid`. Repeat with
-prompt and output IDs `001` through `010` using a fixed seed policy. Set each
-output file path with `--output`.
+`001.json`. It does not read the prompt's ground-truth `piano.mid`.
+To generate all ten prompts in one command (seed 2001 is reset for each
+prompt), run:
+
+```bash
+uv run python infer_bonus.py --checkpoint checkpoints/bonus_interleaved/step_00030000.pt --prompt-root POP909/prompts/bonus --output-dir results/bonus --top-k 50 --temperature 1.0 --seed 2001
+```
+
+This writes `001.mid` through `010.mid` with matching JSON files. Batch mode
+refuses existing output files; use a new output directory for another run.
 
 Render a WAV and evaluate the complete ten-file set with:
 
@@ -456,6 +541,3 @@ uv run python ../hw2_sample/HW2_scripts/eval_bonus.py \
   --prompt_dir POP909/prompts/bonus --gen_midi_dir results/bonus \
   --output_csv results/bonus_metrics.csv
 ```
-
-The TA evaluator expects generated files named `001.mid` through `010.mid`.
-Run it after generating all ten files for the formal comparison.

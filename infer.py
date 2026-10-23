@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 from bisect import bisect_right
@@ -27,19 +28,34 @@ ROLES = {"MELODY": 0, "BRIDGE": 1, "PIANO": 2}
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--prompt-midi", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--checkpoint", type=Path,
+                        help="Checkpoint for one Basic B configuration")
+    parser.add_argument("--all-configs", action="store_true",
+                        help="Generate N20T10, N50T10, and C20T10 for all prompts")
+    parser.add_argument("--no-chord-checkpoint", type=Path,
+                        default=Path("checkpoints/no_chords/step_00030000.pt"))
+    parser.add_argument("--chord-checkpoint", type=Path,
+                        default=Path("checkpoints/chords/step_00030000.pt"))
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--prompt-midi", type=Path)
+    inputs.add_argument("--prompt-root", type=Path,
+                        help="Generate all three Basic B prompts in this directory")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--output-dir", type=Path,
+                        help="Directory for 001.mid, 002.mid, and 003.mid")
     parser.add_argument("--beat-file", type=Path, help="Defaults to prompt/beat_midi.txt")
     parser.add_argument("--chord-file", type=Path, help="Defaults to prompt/chord_midi.txt")
     parser.add_argument("--tokenizer", type=Path, default=Path(
         "data/miditok_remi_chords/miditok_tokenizer.json"))
+    parser.add_argument("--no-chord-tokenizer", type=Path, default=Path(
+        "data/miditok_remi_no_chords/miditok_tokenizer.json"))
     sampling = parser.add_mutually_exclusive_group()
     sampling.add_argument("--top-k", type=int, help="Default: 50")
     sampling.add_argument("--top-p", type=float, help="Nucleus sampling, e.g. 0.9")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=20000)
-    parser.add_argument("--seed", type=int, default=2000)
+    parser.add_argument("--seed", type=int,
+                        help="Default: 2000 for one configuration, 42 for --all-configs")
     parser.add_argument("--experiment-id", help="Recorded in the output metadata")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     return parser.parse_args()
@@ -265,37 +281,12 @@ def write_midi(prompt: Score, tokens: list[str], tokenizer: REMI, path: Path) ->
     return added
 
 
-def main() -> None:
-    args = arguments()
+def generate_one(args: argparse.Namespace, tokenizer: REMI,
+                 model: TransformerXL, vocab: dict[str, int],
+                 metadata: dict, tokenizer_hash: str,
+                 checkpoint_hash: str, device: torch.device) -> None:
     if args.output.suffix.lower() not in {".mid", ".midi"}:
         raise ValueError("--output must end in .mid or .midi")
-    if args.temperature <= 0 or args.max_new_tokens < 1:
-        raise ValueError("temperature and max-new-tokens must be positive")
-    if args.top_k is not None and args.top_k < 0:
-        raise ValueError("top-k must be nonnegative")
-    if args.top_p is not None and not 0 < args.top_p <= 1:
-        raise ValueError("top-p must be in (0, 1]")
-    device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    if args.device != "auto":
-        device_name = args.device
-    if device_name == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA unavailable")
-    device = torch.device(device_name)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    vocab: dict[str, int] = checkpoint["vocab"]
-    if sorted(vocab.values()) != list(range(len(vocab))):
-        raise ValueError("Checkpoint vocabulary IDs are not contiguous")
-    if not {"<PAD>", "<BOS>", "<EOS>", "Bar_None"} <= vocab.keys():
-        raise ValueError("Checkpoint lacks boundary or bar tokens")
-    metadata = checkpoint["tokenizer_config"]
-    tokenizer_hash = file_hash(args.tokenizer)
-    if tokenizer_hash != metadata["tokenizer_sha256"]:
-        raise ValueError("Tokenizer file does not match checkpoint")
-    if metadata["track_programs"] != ROLES:
-        raise ValueError("Checkpoint uses a different track mapping")
-    tokenizer = REMI(params=args.tokenizer)
-    if not tokenizer.one_token_stream:
-        raise ValueError("Expected a single-stream REMI tokenizer")
     beats = beat_grid(args.beat_file or args.prompt_midi.with_name("beat_midi.txt"))
     prompt, prompt_notes = prompt_score(args.prompt_midi, beats)
     chord_file = None
@@ -303,9 +294,6 @@ def main() -> None:
         chord_file = args.chord_file or args.prompt_midi.with_name("chord_midi.txt")
     prefix = tokenize_prompt(prompt, beats, chord_file, tokenizer, vocab)
     quantization_changed = prompt_quantization_changed(prompt, prefix, tokenizer)
-    model = TransformerXL(ModelConfig(**checkpoint["model_config"]))
-    model.load_state_dict(checkpoint["model"])
-    model.to(device).eval()
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
@@ -313,7 +301,7 @@ def main() -> None:
     generated_notes = write_midi(prompt, prefix + generated, tokenizer, args.output)
     record = {
         "experiment_id": args.experiment_id or args.output.parent.name,
-        "checkpoint_hash": file_hash(args.checkpoint),
+        "checkpoint_hash": checkpoint_hash,
         "tokenizer_hash": tokenizer_hash,
         "prompt_id": args.prompt_midi.parent.name,
         "prompt_midi": str(args.prompt_midi),
@@ -333,6 +321,92 @@ def main() -> None:
         json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote {args.output}: 8 prompt + 24 generated bars; "
           f"{prompt_notes} prompt notes + {generated_notes} generated notes")
+
+
+def load_components(checkpoint_path: Path, tokenizer_path: Path, device: torch.device
+                    ) -> tuple[REMI, TransformerXL, dict[str, int], dict, str, str]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    vocab: dict[str, int] = checkpoint["vocab"]
+    if sorted(vocab.values()) != list(range(len(vocab))):
+        raise ValueError("Checkpoint vocabulary IDs are not contiguous")
+    if not {"<PAD>", "<BOS>", "<EOS>", "Bar_None"} <= vocab.keys():
+        raise ValueError("Checkpoint lacks boundary or bar tokens")
+    metadata = checkpoint["tokenizer_config"]
+    tokenizer_hash = file_hash(tokenizer_path)
+    if tokenizer_hash != metadata["tokenizer_sha256"]:
+        raise ValueError("Tokenizer file does not match checkpoint")
+    if metadata["track_programs"] != ROLES:
+        raise ValueError("Checkpoint uses a different track mapping")
+    tokenizer = REMI(params=tokenizer_path)
+    if not tokenizer.one_token_stream:
+        raise ValueError("Expected a single-stream REMI tokenizer")
+    model = TransformerXL(ModelConfig(**checkpoint["model_config"]))
+    model.load_state_dict(checkpoint["model"])
+    model.to(device).eval()
+    return tokenizer, model, vocab, metadata, tokenizer_hash, file_hash(checkpoint_path)
+
+
+def main() -> None:
+    args = arguments()
+    if args.all_configs:
+        if (args.prompt_root is None or args.output_dir is None or args.output is not None
+                or args.checkpoint is not None or args.beat_file is not None
+                or args.chord_file is not None or args.top_k is not None
+                or args.top_p is not None or args.experiment_id is not None
+                or args.temperature != 1.0):
+            raise ValueError("--all-configs needs --prompt-root and --output-dir; sampling settings are fixed by each configuration")
+        configs = (
+            ("N20T10", args.no_chord_checkpoint, args.no_chord_tokenizer, 20),
+            ("N50T10", args.no_chord_checkpoint, args.no_chord_tokenizer, 50),
+            ("C20T10", args.chord_checkpoint, args.tokenizer, 20),
+        )
+        jobs = [(name, args.prompt_root / f"{i:03d}" / f"{i:03d}.mid",
+                 args.output_dir / name / f"{i:03d}.mid", checkpoint, tokenizer, top_k)
+                for name, checkpoint, tokenizer, top_k in configs for i in range(1, 4)]
+    elif args.prompt_root is not None:
+        if (args.checkpoint is None or args.output_dir is None or args.output is not None
+                or args.beat_file is not None or args.chord_file is not None):
+            raise ValueError("--prompt-root requires --checkpoint and --output-dir without single-prompt options")
+        jobs = [(None, args.prompt_root / f"{i:03d}" / f"{i:03d}.mid",
+                 args.output_dir / f"{i:03d}.mid", args.checkpoint, args.tokenizer,
+                 args.top_k) for i in range(1, 4)]
+    else:
+        if args.checkpoint is None or args.output is None or args.output_dir is not None:
+            raise ValueError("--prompt-midi requires --checkpoint and --output")
+        jobs = [(None, args.prompt_midi, args.output, args.checkpoint,
+                 args.tokenizer, args.top_k)]
+    if args.temperature <= 0 or args.max_new_tokens < 1:
+        raise ValueError("temperature and max-new-tokens must be positive")
+    if args.top_k is not None and args.top_k < 0:
+        raise ValueError("top-k must be nonnegative")
+    if args.top_p is not None and not 0 < args.top_p <= 1:
+        raise ValueError("top-p must be in (0, 1]")
+    if args.prompt_root is not None:
+        for _, prompt, output, _, _, _ in jobs:
+            if not prompt.is_file():
+                raise FileNotFoundError(prompt)
+            if output.exists() or output.with_suffix(".json").exists():
+                raise FileExistsError(f"Batch output already exists: {output}")
+    device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device != "auto":
+        device_name = args.device
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA unavailable")
+    device = torch.device(device_name)
+    cache = {}
+    for name, prompt, output, checkpoint_path, tokenizer_path, top_k in jobs:
+        key = (checkpoint_path, tokenizer_path)
+        if key not in cache:
+            cache[key] = load_components(checkpoint_path, tokenizer_path, device)
+        tokenizer, model, vocab, metadata, tokenizer_hash, checkpoint_hash = cache[key]
+        current = copy.copy(args)
+        current.prompt_midi, current.output = prompt, output
+        current.top_k = top_k
+        current.seed = args.seed if args.seed is not None else (42 if args.all_configs else 2000)
+        if name is not None:
+            current.experiment_id = name
+        generate_one(current, tokenizer, model, vocab, metadata,
+                     tokenizer_hash, checkpoint_hash, device)
 
 
 if __name__ == "__main__":

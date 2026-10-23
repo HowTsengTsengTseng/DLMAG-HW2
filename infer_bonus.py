@@ -22,11 +22,16 @@ from utils import sha256
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--prompt-midi", type=Path, required=True,
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--prompt-midi", type=Path,
                         help="POP909/prompts/bonus/NNN/melody.mid")
+    inputs.add_argument("--prompt-root", type=Path,
+                        help="Generate all ten bonus prompts in this directory")
     parser.add_argument("--beat-file", type=Path,
                         help="Defaults to beat_midi.txt beside melody.mid")
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--output-dir", type=Path,
+                        help="Directory for 001.mid through 010.mid")
     sampling = parser.add_mutually_exclusive_group()
     sampling.add_argument("--top-k", type=int)
     sampling.add_argument("--top-p", type=float)
@@ -142,10 +147,51 @@ def write_output(source: pretty_midi.PrettyMIDI, grid: BeatGrid,
     return len(piano.notes)
 
 
-def main() -> None:
-    args = arguments()
+def generate_one(args: argparse.Namespace, model: TransformerXL,
+                 vocab: dict[str, int], device: torch.device,
+                 checkpoint_hash: str) -> None:
     if args.output.suffix.lower() not in {".mid", ".midi"}:
         raise ValueError("--output must end in .mid or .midi")
+    beat_file = args.beat_file or args.prompt_midi.with_name("beat_midi.txt")
+    grid = BeatGrid.load(beat_file)
+    source = pretty_midi.PrettyMIDI(str(args.prompt_midi))
+    melodies = prompt_bars(source, grid)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+    bars, forced = generate(model, vocab, melodies, args, device)
+    note_count = write_output(source, grid, bars, args.output)
+    record = {
+        "prompt_midi": str(args.prompt_midi), "beat_file": str(beat_file),
+        "output_midi": str(args.output), "checkpoint_sha256": checkpoint_hash,
+        "seed": args.seed, "top_k": 50 if args.top_k is None and args.top_p is None
+        else args.top_k, "top_p": args.top_p,
+        "temperature": args.temperature, "bars": len(bars),
+        "melody_notes": len(source.instruments[0].notes), "piano_notes": note_count,
+        "forced_bar_boundaries": forced,
+        "conditioning": "given melody inserted before each generated piano bar",
+    }
+    args.output.with_suffix(".json").write_text(
+        json.dumps(record, indent=2), encoding="utf-8")
+    print(f"Wrote {args.output}: 16 bars, {note_count} generated PIANO notes")
+
+
+def main() -> None:
+    args = arguments()
+    if args.prompt_root is not None:
+        if args.output_dir is None or args.output is not None or args.beat_file is not None:
+            raise ValueError("--prompt-root requires --output-dir and cannot use --output or --beat-file")
+        jobs = [(args.prompt_root / f"{i:03d}" / "melody.mid",
+                 args.output_dir / f"{i:03d}.mid") for i in range(1, 11)]
+        for prompt, output in jobs:
+            if not prompt.is_file():
+                raise FileNotFoundError(prompt)
+            if output.exists() or output.with_suffix(".json").exists():
+                raise FileExistsError(f"Batch output already exists: {output}")
+    else:
+        if args.output is None or args.output_dir is not None:
+            raise ValueError("--prompt-midi requires --output and cannot use --output-dir")
+        jobs = [(args.prompt_midi, args.output)]
     if args.temperature <= 0 or args.max_notes_per_bar < 1:
         raise ValueError("Temperature and maximum notes per bar must be positive")
     if args.top_k is not None and args.top_k < 0:
@@ -167,28 +213,11 @@ def main() -> None:
     model = TransformerXL(ModelConfig(**checkpoint["model_config"]))
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
-    beat_file = args.beat_file or args.prompt_midi.with_name("beat_midi.txt")
-    grid = BeatGrid.load(beat_file)
-    source = pretty_midi.PrettyMIDI(str(args.prompt_midi))
-    melodies = prompt_bars(source, grid)
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
-    bars, forced = generate(model, vocab, melodies, args, device)
-    note_count = write_output(source, grid, bars, args.output)
-    record = {
-        "prompt_midi": str(args.prompt_midi), "beat_file": str(beat_file),
-        "output_midi": str(args.output), "checkpoint_sha256": sha256(args.checkpoint),
-        "seed": args.seed, "top_k": 50 if args.top_k is None and args.top_p is None
-        else args.top_k, "top_p": args.top_p,
-        "temperature": args.temperature, "bars": len(bars),
-        "melody_notes": len(source.instruments[0].notes), "piano_notes": note_count,
-        "forced_bar_boundaries": forced,
-        "conditioning": "given melody inserted before each generated piano bar",
-    }
-    args.output.with_suffix(".json").write_text(
-        json.dumps(record, indent=2), encoding="utf-8")
-    print(f"Wrote {args.output}: 16 bars, {note_count} generated PIANO notes")
+    checkpoint_hash = sha256(args.checkpoint)
+    for prompt, output in jobs:
+        current = copy.copy(args)
+        current.prompt_midi, current.output = prompt, output
+        generate_one(current, model, vocab, device, checkpoint_hash)
 
 
 if __name__ == "__main__":

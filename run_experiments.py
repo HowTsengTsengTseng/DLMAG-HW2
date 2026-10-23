@@ -38,8 +38,11 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--chord-tokenizer", type=Path, default=Path(
         "data/miditok_remi_chords/miditok_tokenizer.json"))
     parser.add_argument("--output-root", type=Path, default=Path("results"))
-    parser.add_argument("--configs", nargs="+", choices=tuple(CONFIGS),
-                        default=list(CONFIGS))
+    config_group = parser.add_mutually_exclusive_group()
+    config_group.add_argument("--config", choices=tuple(CONFIGS),
+                              help="Run one Basic A configuration")
+    config_group.add_argument("--configs", nargs="+", choices=tuple(CONFIGS),
+                              help="Run selected Basic A configurations (default: all seven)")
     parser.add_argument("--a-count", type=int, default=20)
     parser.add_argument("--max-new-tokens", type=int, default=20000)
     parser.add_argument("--retries", type=int, default=2,
@@ -52,7 +55,9 @@ def arguments() -> argparse.Namespace:
 
 def main() -> None:
     args = arguments()
-    selected = dict.fromkeys(args.configs)
+    selected = dict.fromkeys(
+        [args.config] if args.config else (args.configs or CONFIGS)
+    )
     files = {
         False: (args.no_chord_checkpoint, args.no_chord_tokenizer),
         True: (args.chord_checkpoint, args.chord_tokenizer),

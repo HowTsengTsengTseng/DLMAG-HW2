@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 checkpoints/
+submission/
 data/
 POP909/
 third_party/
